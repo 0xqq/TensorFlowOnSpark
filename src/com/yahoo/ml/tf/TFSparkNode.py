@@ -29,6 +29,7 @@ import multiprocessing
 import time
 import uuid
 from . import TFManager
+from . import latch
 
 class TFNodeContext:
   """This encapsulates key metadata for each TF node"""
@@ -62,7 +63,7 @@ def _get_manager(cluster_info, host, ppid):
     logging.info("Connected to TFSparkNode.mgr on {0}, ppid={1}, state={2}".format(host, ppid, str(TFSparkNode.mgr.get('state'))))
     return TFSparkNode.mgr
 
-def reserve(cluster_spec, tensorboard, cluster_id, queues=['input', 'output']):
+def reserve(cluster_spec, tensorboard, cluster_id, latch_addr, queues=['input', 'output']):
     """
     Allocates a port for Tensorflow on this node, starts TensorBoard if requested, and starts a multiprocessing.Manager to listen for data/control msgs.
     """
@@ -139,8 +140,9 @@ def reserve(cluster_spec, tensorboard, cluster_id, queues=['input', 'output']):
         s.bind(('',0))
         port = s.getsockname()[1]
 
-        # sleep a bit to force Spark to distribute the remaining reservation tasks to other/idle executors
-        time.sleep(10)
+        # wait for all executors to finish reservation
+        latch_client = latch.LatchClient(latch_addr)
+        latch_client.await()
 
         s.close()
 
@@ -161,7 +163,7 @@ def reserve(cluster_spec, tensorboard, cluster_id, queues=['input', 'output']):
         return [resp]
     return _reserve
 
-def start(fn, tf_args, cluster_info, defaultFS, working_dir, background):
+def start(fn, tf_args, cluster_info, defaultFS, working_dir, latch_addr, background):
     """
     Wraps the TensorFlow main function in a Spark mapPartitions-compatible function.
     """
@@ -181,9 +183,9 @@ def start(fn, tf_args, cluster_info, defaultFS, working_dir, background):
 
         # expand Hadoop classpath wildcards for JNI (Spark 2.x)
         if 'HADOOP_PREFIX' in os.environ:
+            hadoop_prefix = os.environ['HADOOP_PREFIX']
             classpath = os.environ['CLASSPATH']
-            hadoop_path = os.path.join(os.environ['HADOOP_PREFIX'], 'bin', 'hadoop')
-            hadoop_classpath = subprocess.check_output([hadoop_path, 'classpath', '--glob']).decode()
+            hadoop_classpath = subprocess.check_output(['{0}/bin/hadoop'.format(hadoop_prefix), 'classpath', '--glob']).decode()
             logging.debug("CLASSPATH: {0}".format(hadoop_classpath))
             os.environ['CLASSPATH'] = classpath + os.pathsep + hadoop_classpath
 
@@ -200,6 +202,11 @@ def start(fn, tf_args, cluster_info, defaultFS, working_dir, background):
         mgr = _get_manager(cluster_info, host, ppid)
 
         ctx = TFNodeContext(worker_num, job_name, task_index, spec, defaultFS, working_dir, mgr)
+
+        # wait for all executors to ack start
+        logging.debug("Waiting for latch {0}".format(latch_addr))
+        latch_client = latch.LatchClient(latch_addr)
+        latch_client.await()
 
         # Background mode relies reuse of python worker in Spark.
         if background:

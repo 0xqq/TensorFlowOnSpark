@@ -16,6 +16,7 @@ import os
 import random
 import threading
 import time
+from . import latch
 from . import TFManager
 from . import TFSparkNode
 
@@ -28,6 +29,7 @@ class TFCluster(object):
   sc = None
   defaultFS = None
   working_dir = None
+  num_executors = None
   nodeRDD = None
   cluster_id = None
   cluster_info = None
@@ -39,20 +41,27 @@ class TFCluster(object):
       Starts the TensorFlow main function on each node/executor (per cluster_spec) in a background thread on the driver.
       """
       logging.info("Starting TensorFlow")
+
+      # start a latch server to synchronize executors
+      latch_server = latch.LatchServer(self.num_executors)
+      latch_addr = latch_server.start()
+      logging.debug("started latch_server: {0}".format(latch_addr))
+
       def _start():
           self.nodeRDD.foreachPartition(TFSparkNode.start(map_fun,
                                                           tf_args,
                                                           self.cluster_info,
                                                           self.defaultFS,
                                                           self.working_dir,
+                                                          latch_addr,
                                                           background=(self.input_mode == InputMode.SPARK)))
 
       # start TF on a background thread (on Spark driver)
       t = threading.Thread(target=_start)
       t.start()
 
-      # sleep a bit to avoid having the next Spark job scheduled before the TFSparkNode.start() tasks on the background thread.
-      time.sleep(5)
+      # allow time for executors to start TFNodes
+      latch_server.await()
 
   def train(self, dataRDD, num_epochs=0, qname='input'):
       """
@@ -179,17 +188,27 @@ def reserve(sc, num_executors, num_ps, tensorboard=False, input_mode=InputMode.T
     if defaultFS.startswith("file://") and len(defaultFS) > 7 and defaultFS.endswith("/"):
         defaultFS = defaultFS[:-1]
 
+    # start a latch server to synchronize executors
+    latch_server = latch.LatchServer(num_executors)
+    latch_addr = latch_server.start()
+
     # create TFCluster object
     cluster_id = random.getrandbits(64)
     cluster = TFCluster()
     cluster.sc = sc
     cluster.defaultFS = sc._jsc.hadoopConfiguration().get("fs.defaultFS")
     cluster.working_dir = os.getcwd()
+    cluster.num_executors = num_executors
     cluster.nodeRDD = sc.parallelize(range(num_executors), num_executors)
     cluster.cluster_id = cluster_id
     cluster.input_mode = input_mode
     cluster.queues = queues
-    cluster.cluster_info = cluster.nodeRDD.mapPartitions(TFSparkNode.reserve(spec, tensorboard, cluster_id, queues)).collect()
+
+    # reserve task across all executors
+    cluster.cluster_info = cluster.nodeRDD.mapPartitions(TFSparkNode.reserve(spec, tensorboard, cluster_id, latch_addr, queues)).collect()
+
+    # stop latch server
+    latch_server.stop()
 
     # print cluster_info and extract TensorBoard URL
     tb_url = None
